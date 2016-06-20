@@ -86,33 +86,32 @@ func (r *controller) Prepare(ctx context.Context) error {
 		return err
 	}
 
-	for {
-		if err := r.checkClosed(); err != nil {
-			return err
-		}
+	if err := r.adapter.pullImage(ctx); err != nil {
+		// NOTE(stevvooe): We always try to pull the image to make sure we have
+		// the most up to date version. This will return an error, but we only
+		// log it. If the image truly doesn't exist, the create below will
+		// error out.
+		//
+		// This gives us some nice behavior where we use up to date versions of
+		// mutable tags, but will still run if the old image is available but a
+		// registry is down.
+		//
+		// If you don't want this behavior, lock down your image to an
+		// immutable tag or digest.
+		log.G(ctx).WithError(err).Error("pulling image failed")
+	}
 
-		if err := r.adapter.create(ctx); err != nil {
-			if isContainerCreateNameConflict(err) {
-				if _, err := r.adapter.inspect(ctx); err != nil {
-					return err
-				}
-
-				// container is already created. success!
-				return exec.ErrTaskPrepared
-			}
-
-			if !engineapi.IsErrImageNotFound(err) {
+	if err := r.adapter.create(ctx); err != nil {
+		if isContainerCreateNameConflict(err) {
+			if _, err := r.adapter.inspect(ctx); err != nil {
 				return err
 			}
 
-			if err := r.adapter.pullImage(ctx); err != nil {
-				return err
-			}
-
-			continue // retry to create the container
+			// container is already created. success!
+			return exec.ErrTaskPrepared
 		}
 
-		break
+		return err
 	}
 
 	return nil
@@ -194,6 +193,14 @@ func (r *controller) Wait(pctx context.Context) error {
 				// If we get here, something has gone wrong but we want to exit
 				// and report anyways.
 				return ErrContainerDestroyed
+
+			case "health_status: unhealthy":
+				// in this case, we stop the container and report unhealthy status
+				// TODO(runshenzhu): double check if it can cause a dead lock issue here
+				if err := r.Shutdown(ctx); err != nil {
+					return errors.Wrap(err, "unhealthy container shutdown failed")
+				}
+				return ErrContainerUnhealthy
 			}
 		case <-closed:
 			// restart!

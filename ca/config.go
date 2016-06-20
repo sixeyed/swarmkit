@@ -139,7 +139,7 @@ func NewConfigPaths(baseCertDir string) *SecurityConfigPaths {
 // LoadOrCreateSecurityConfig encapsulates the security logic behind joining a cluster.
 // Every node requires at least a set of TLS certificates with which to join the cluster with.
 // In the case of a manager, these certificates will be used both for client and server credentials.
-func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, caHash, secret, proposedRole string, picker *picker.Picker, nodeInfo chan<- string) (*SecurityConfig, error) {
+func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, caHash, secret, proposedRole string, picker *picker.Picker, nodeInfo chan<- api.IssueNodeCertificateResponse) (*SecurityConfig, error) {
 	paths := NewConfigPaths(baseCertDir)
 
 	var (
@@ -164,8 +164,18 @@ func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, caHash, secret
 			return nil, err
 		}
 
-		// Get the remote CA certificate, verify integrity with the hash provided
-		rootCA, err = GetRemoteCA(ctx, d, picker)
+		// Get the remote CA certificate, verify integrity with the
+		// hash provided. Retry up to 5 times, in case the manager we
+		// first try to contact is not responding properly (it may have
+		// just been demoted, for example).
+
+		for i := 0; i != 5; i++ {
+			rootCA, err = GetRemoteCA(ctx, d, picker)
+			if err == nil {
+				break
+			}
+			log.Warningf("failed to retrieve remote root CA certificate: %v", err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -198,7 +208,10 @@ func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, caHash, secret
 			org := identity.NewID()
 
 			if nodeInfo != nil {
-				nodeInfo <- cn
+				nodeInfo <- api.IssueNodeCertificateResponse{
+					NodeID:         cn,
+					NodeMembership: api.NodeMembershipAccepted,
+				}
 			}
 			tlsKeyPair, err = rootCA.IssueAndSaveNewCertificates(paths.Node, cn, proposedRole, org)
 		} else {
@@ -225,7 +238,10 @@ func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, caHash, secret
 		log.Debugf("new TLS credentials generated: %s.", paths.Node.Cert)
 	} else {
 		if nodeInfo != nil {
-			nodeInfo <- clientTLSCreds.NodeID()
+			nodeInfo <- api.IssueNodeCertificateResponse{
+				NodeID:         clientTLSCreds.NodeID(),
+				NodeMembership: api.NodeMembershipAccepted,
+			}
 		}
 		log.Debugf("loaded local TLS credentials: %s.", paths.Node.Cert)
 	}

@@ -1,9 +1,14 @@
 package controlapi
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/swarmkit/api"
+	"github.com/docker/swarmkit/api/duration"
+	"github.com/docker/swarmkit/protobuf/ptypes"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -83,19 +88,17 @@ func TestValidateResourceRequirements(t *testing.T) {
 	}
 }
 
-func TestValidateServiceSpecTemplate(t *testing.T) {
+func TestValidateTask(t *testing.T) {
 	type badSource struct {
-		s *api.ServiceSpec
+		s api.TaskSpec
 		c codes.Code
 	}
 
 	for _, bad := range []badSource{
 		{
-			s: &api.ServiceSpec{
-				Task: api.TaskSpec{
-					Runtime: &api.TaskSpec_Container{
-						Container: nil,
-					},
+			s: api.TaskSpec{
+				Runtime: &api.TaskSpec_Container{
+					Container: nil,
 				},
 			},
 			c: codes.InvalidArgument,
@@ -111,23 +114,23 @@ func TestValidateServiceSpecTemplate(t *testing.T) {
 		//	c: codes.Unimplemented,
 		// },
 		{
-			s: createSpec("", "", 0),
+			s: createSpec("", "", 0).Task,
 			c: codes.InvalidArgument,
 		},
 		{
-			s: createSpec("", "busybox###", 0),
+			s: createSpec("", "busybox###", 0).Task,
 			c: codes.InvalidArgument,
 		},
 	} {
-		err := validateServiceSpecTemplate(bad.s)
+		err := validateTask(bad.s)
 		assert.Error(t, err)
 		assert.Equal(t, bad.c, grpc.Code(err))
 	}
 
-	for _, good := range []*api.ServiceSpec{
-		createSpec("", "image", 0),
+	for _, good := range []api.TaskSpec{
+		createSpec("", "image", 0).Task,
 	} {
-		err := validateServiceSpecTemplate(good)
+		err := validateTask(good)
 		assert.NoError(t, err)
 	}
 }
@@ -170,6 +173,57 @@ func TestValidateServiceSpec(t *testing.T) {
 	} {
 		err := validateServiceSpec(good)
 		assert.NoError(t, err)
+	}
+}
+
+func TestValidateRestartPolicy(t *testing.T) {
+	bad := []*api.RestartPolicy{
+		{
+			Delay:  ptypes.DurationProto(time.Duration(-1 * time.Second)),
+			Window: ptypes.DurationProto(time.Duration(-1 * time.Second)),
+		},
+		{
+			Delay:  ptypes.DurationProto(time.Duration(20 * time.Second)),
+			Window: ptypes.DurationProto(time.Duration(-4 * time.Second)),
+		},
+	}
+
+	good := []*api.RestartPolicy{
+		{
+			Delay:  ptypes.DurationProto(time.Duration(10 * time.Second)),
+			Window: ptypes.DurationProto(time.Duration(1 * time.Second)),
+		},
+	}
+
+	for _, b := range bad {
+		err := validateRestartPolicy(b)
+		assert.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, grpc.Code(err))
+	}
+
+	for _, g := range good {
+		assert.NoError(t, validateRestartPolicy(g))
+	}
+}
+
+func TestValidateUpdate(t *testing.T) {
+	bad := []*api.UpdateConfig{
+		{Delay: duration.Duration{Seconds: -1, Nanos: 0}},
+		{Delay: duration.Duration{Seconds: -1000, Nanos: 0}},
+	}
+
+	good := []*api.UpdateConfig{
+		{Delay: duration.Duration{Seconds: 1, Nanos: 0}},
+	}
+
+	for _, b := range bad {
+		err := validateUpdate(b)
+		assert.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, grpc.Code(err))
+	}
+
+	for _, g := range good {
+		assert.NoError(t, validateUpdate(g))
 	}
 }
 
@@ -265,6 +319,35 @@ func TestUpdateService(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TODO(dongluochen): Network update is not supported yet and it's blocked
+// from controlapi. This test should be removed once network update is supported.
+func TestServiceUpdateRejectNetworkChange(t *testing.T) {
+	ts := newTestServer(t)
+	spec := createSpec("name", "image", 1)
+	spec.Networks = []*api.ServiceSpec_NetworkAttachmentConfig{
+		{
+			Target: "net20",
+		},
+	}
+	cr, err := ts.Client.CreateService(context.Background(), &api.CreateServiceRequest{Spec: spec})
+	assert.NoError(t, err)
+
+	ur, err := ts.Client.GetService(context.Background(), &api.GetServiceRequest{ServiceID: cr.Service.ID})
+	assert.NoError(t, err)
+	service := ur.Service
+
+	service.Spec.Networks[0].Target = "net30"
+
+	_, err = ts.Client.UpdateService(context.Background(), &api.UpdateServiceRequest{
+		ServiceID:      service.ID,
+		Spec:           &service.Spec,
+		ServiceVersion: &service.Meta.Version,
+	})
+	assert.Error(t, err)
+	fmt.Println("error = ", err.Error())
+	assert.True(t, strings.Contains(err.Error(), errNetworkUpdateNotSupported.Error()))
+}
+
 func TestRemoveService(t *testing.T) {
 	ts := newTestServer(t)
 	_, err := ts.Client.RemoveService(context.Background(), &api.RemoveServiceRequest{})
@@ -275,6 +358,50 @@ func TestRemoveService(t *testing.T) {
 	r, err := ts.Client.RemoveService(context.Background(), &api.RemoveServiceRequest{ServiceID: service.ID})
 	assert.NoError(t, err)
 	assert.NotNil(t, r)
+}
+
+func TestServiceEndpointSpecUpdate(t *testing.T) {
+	ts := newTestServer(t)
+	spec := &api.ServiceSpec{
+		Annotations: api.Annotations{
+			Name: "name",
+		},
+		Task: api.TaskSpec{
+			Runtime: &api.TaskSpec_Container{
+				Container: &api.ContainerSpec{
+					Image: "image",
+				},
+			},
+		},
+		Mode: &api.ServiceSpec_Replicated{
+			Replicated: &api.ReplicatedService{
+				Replicas: 1,
+			},
+		},
+		Endpoint: &api.EndpointSpec{
+			Ports: []*api.PortConfig{
+				{
+					Name:       "http",
+					TargetPort: 80,
+				},
+			},
+		},
+	}
+
+	r, err := ts.Client.CreateService(context.Background(),
+		&api.CreateServiceRequest{Spec: spec})
+	assert.NoError(t, err)
+	assert.NotNil(t, r)
+
+	// Update the service with duplicate ports
+	spec.Endpoint.Ports = append(spec.Endpoint.Ports, &api.PortConfig{
+		Name:       "fakehttp",
+		TargetPort: 80,
+	})
+	_, err = ts.Client.UpdateService(context.Background(),
+		&api.UpdateServiceRequest{Spec: spec})
+	assert.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, grpc.Code(err))
 }
 
 func TestListServices(t *testing.T) {
